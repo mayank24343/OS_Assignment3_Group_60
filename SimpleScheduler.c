@@ -1,3 +1,12 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <semaphore.h>
+#include <fcntl.h>
+#include <time.h>
 
 //how the queue will work
 //maintain like a pointer to start of queue & the current pointer
@@ -6,7 +15,7 @@
 //the first time u encounter an already running process - means u have seen all the processes in the table - so stop now
 //signal handler required, which handles SIGINT: will wait for the processes to finish, display information & then exit
 
-int main(){
+int main(int argc, char** argv){
 	//sigint signal handler
 	//access the shared memory which has the process table
 	while (1){

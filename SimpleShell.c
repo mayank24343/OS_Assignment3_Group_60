@@ -6,6 +6,10 @@
 #include <string.h>
 #include <time.h>
 #include <signal.h>
+#include <sys/shm.h>
+#include <sys/ipc.h>
+#include <semaphore.h>
+#include <fcntl.h>
 
 typedef struct{
 	char command[1024];
@@ -64,7 +68,6 @@ void shell_loop(){
 			submit(command);//submit command for execution
 		}
 		free(command); //free memory for cleanup
-		//traverse through the process table, if any child has ended - put process state as finished, else move on dont block (waitpid with WNOHANG)
 	}
 }
 
@@ -81,6 +84,8 @@ int main(int argc,char** argv){
 		exit(1);
 	}
 	//initialise a shared memory for storing the process table (linked list) & sempaphore for mutual exclusion while modifying the process table
+	//start a process to start execution of simple scheduler
+	//also need a signal handler to handle SIGCHLD by the submitted process when they end, need to update process table & mark them as finished
 	shell_loop();
 	return 0;
 }
