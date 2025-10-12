@@ -1,68 +1,156 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <string.h>
 #include <signal.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
 #include <semaphore.h>
 #include <fcntl.h>
 #include <time.h>
 
-typedef struct{
-        char command[1024];
-        pid_t pid;
-        unsigned int tslices_on_cpu;
-        unsigned int tslices_off_cpu;
-        int state;
-        //state is 0: ready 1: running 2: finished
+#define SHM_NAME "/processtable"
+
+typedef struct {
+    char command[1024];
+    pid_t pid;
+    unsigned int tslices_on_cpu;
+    unsigned int tslices_off_cpu;
+    int state;
+    //state is 0: ready 1: running 2: finished
 } Process;
 
-typedef struct{
-        Process table[256];
-        int count;
-        sem_t* sem;
+typedef struct {
+    Process table[256];
+    int count;
+    sem_t sem; 
 } SharedProcessTable;
 
 SharedProcessTable* processtable;
 int shm_fd;
-//how the queue will work
-//maintain like a pointer to start of queue & the current pointer
-//current pointer moves to give the next ncpu processes with state ready
-//if ncpu not found till end of table, it loops back to the start using the start pointer
-//the first time u encounter an already running process - means u have seen all the processes in the table - so stop now
+int ncpu, tslice;
+volatile sig_atomic_t stop_scheduler = 0; //flag to stop the scheduler loop
 
-//signal handler required, which handles SIGINT: will wait for the processes to finish, display information & then exit
-static void my_handler(int signal){
+//signal handler for SIGINT.
+static void my_handler(int signal) {
+    if (signal == SIGINT) {
+        printf("\nScheduler received SIGINT\n");
+        stop_scheduler = 1;
+    }
 }
 
-void setup(){
-	shm_fd = shm_open(SHM_NAME, O_RDWR, 0666);
-	processtable = mmap(NULL, sizeof(SharedProcessTable), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-	if (processtable == MAP_FAILED){
-		perror("mmap failed");
-		exit(1);
-	}
+//map the existing shared memory segment into the scheduler's address space.
+void setup() {
+    shm_fd = shm_open(SHM_NAME, O_RDWR, 0666);
+    if (shm_fd == -1) {
+        perror("shm_open failed");
+        exit(1);
+    }
+
+    processtable = mmap(NULL, sizeof(SharedProcessTable), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (processtable == MAP_FAILED) {
+        perror("mmap failed");
+        exit(1);
+    }
 }
 
-void cleanup(){
-	munmap(processtable,sizeof(SharedProcessTable));
-	close(shm_fd);
+//clean up resources
+void cleanup() {
+    munmap(processtable, sizeof(SharedProcessTable));
+    close(shm_fd);
 }
 
-int main(int argc, char** argv){
-	//sigint signal handler
-	struct sigaction sig;
-	memset(&sig,0,sizeof(sig));
-	sig.sa_handler = my_handler;
-	sigaction(SIGINT,&sig,NULL);
+int main(int argc, char** argv) {
+    if (argc!=3) {
+        fprintf(stderr, "Usage: %s <ncpu> <tslice>\n", argv[0]);
+        exit(1);
+    }
 
-	//access the shared memory which has the process table
-	setup();
-	while (1){
-		//use semaphore, read the process table to find the next ncpu processes to run as per round robin policy, send SIGCONT to these for running & set state = 1 (running) in table
-		//nano sleep for tslice miliseconds
-		//use semaphore, read the ncpu running processes, send SIGSTOP to pause, set state to ready
-	}
-	cleanup();
-	return 0;
+    ncpu = atoi(argv[1]);
+    tslice = atoi(argv[2]);
+
+    if (ncpu <= 0 || tslice <= 0) {
+        fprintf(stderr, "ncpu and tslice must be positive integers.\n");
+        exit(1);
+    }
+
+    //sigint signal handler
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = my_handler;
+    sigaction(SIGINT, &sa, NULL);
+
+    setup();
+
+    int current_idx = 0;
+    int running_processes = 0;
+
+    //main scheduler loop.
+    while (!stop_scheduler) {
+        sem_wait(&processtable->sem);
+
+        running_processes = 0;
+        for (int i = 0; i < processtable->count; i++) {
+            if (processtable->table[i].state == 1) {
+                running_processes++;
+            }
+        }
+
+        //schedule new processes if there are available cpus
+        int scheduled_count = 0;
+        for (int i = 0; i < processtable->count && running_processes < ncpu; i++) {
+            int check_idx = (current_idx + i) % processtable->count;
+            if (processtable->table[check_idx].state == 0) {
+                kill(processtable->table[check_idx].pid, SIGCONT);
+                processtable->table[check_idx].state = 1;
+                running_processes++;
+                scheduled_count++;
+            }
+        }
+        current_idx = (current_idx + scheduled_count) % (processtable->count > 0 ? processtable->count : 1);
+
+         //update time slices for all processes.
+        for (int i = 0; i < processtable->count; i++) {
+            if (processtable->table[i].state == 1) { //running
+                processtable->table[i].tslices_on_cpu++;
+            } else if (processtable->table[i].state == 0) { //ready
+                processtable->table[i].tslices_off_cpu++;
+            }
+        }
+
+        sem_post(&processtable->sem);
+        
+        //sleep for the duration of a time slice
+        usleep(tslice*1000); //usleep takes microseconds
+
+        sem_wait(&processtable->sem);
+        
+        //stop currently running processes
+        for (int i = 0; i < processtable->count; i++) {
+            if (processtable->table[i].state == 1) {
+                kill(processtable->table[i].pid, SIGSTOP);
+                processtable->table[i].state = 0;
+            }
+        }
+
+        //check if all processes have finished
+        int finished_count = 0;
+        for (int i = 0; i < processtable->count; i++) {
+            if (processtable->table[i].state == 2) {
+                finished_count++;
+            }
+        }
+        if (finished_count == processtable->count && processtable->count > 0) {
+            break; //exit loop if all submitted processes are done
+        }
+
+        sem_post(&processtable->sem);
+    }
+
+    //final cleanup
+    cleanup();
+
+    return 0;
 }
