@@ -7,11 +7,12 @@
 #include <sys/shm.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <semaphore.h>
 #include <fcntl.h>
 #include <time.h>
 
-#define SHM_NAME "/processtable"
+#define SHM_NAME "/processtable_shm"
 
 typedef struct {
     char command[1024];
@@ -25,18 +26,20 @@ typedef struct {
 typedef struct {
     Process table[256];
     int count;
-    sem_t sem; 
+    sem_t sem;
 } SharedProcessTable;
 
 SharedProcessTable* processtable;
 int shm_fd;
 int ncpu, tslice;
+int running = 0;
 volatile sig_atomic_t stop_scheduler = 0; //flag to stop the scheduler loop
 
 //signal handler for SIGINT.
 static void my_handler(int signal) {
     if (signal == SIGINT) {
-        printf("\nScheduler received SIGINT\n");
+        printf("\nScheduler received SIGINT - Completing remaining processses & exiting\n");
+	fflush(stdout);
         stop_scheduler = 1;
     }
 }
@@ -71,7 +74,7 @@ int main(int argc, char** argv) {
     ncpu = atoi(argv[1]);
     tslice = atoi(argv[2]);
 
-    if (ncpu <= 0 || tslice <= 0) {
+    if (ncpu < 1 || tslice < 1) {
         fprintf(stderr, "ncpu and tslice must be positive integers.\n");
         exit(1);
     }
@@ -85,53 +88,47 @@ int main(int argc, char** argv) {
     setup();
 
     int current_idx = 0;
-    int running_processes = 0;
+    //int running_processes = 0;
 
     //main scheduler loop.
-    while (!stop_scheduler) {
+    while (1) {
         sem_wait(&processtable->sem);
 
-        running_processes = 0;
-        for (int i = 0; i < processtable->count; i++) {
-            if (processtable->table[i].state == 1) {
-                running_processes++;
-            }
-        }
+        running = 0;
 
         //schedule new processes if there are available cpus
         int scheduled_count = 0;
-        for (int i = 0; i < processtable->count && running_processes < ncpu; i++) {
+        for (int i = 0; i < processtable->count && running < ncpu; i++) {
             int check_idx = (current_idx + i) % processtable->count;
+		//check if process has endeddd
             if (processtable->table[check_idx].state == 0) {
                 kill(processtable->table[check_idx].pid, SIGCONT);
                 processtable->table[check_idx].state = 1;
-                running_processes++;
+                running++;
                 scheduled_count++;
             }
         }
         current_idx = (current_idx + scheduled_count) % (processtable->count > 0 ? processtable->count : 1);
 
-         //update time slices for all processes.
+         //update time slices off cpu for ready processes.
         for (int i = 0; i < processtable->count; i++) {
-            if (processtable->table[i].state == 1) { //running
-                processtable->table[i].tslices_on_cpu++;
-            } else if (processtable->table[i].state == 0) { //ready
+            if (processtable->table[i].state == 0) { //ready
                 processtable->table[i].tslices_off_cpu++;
             }
         }
 
         sem_post(&processtable->sem);
-        
         //sleep for the duration of a time slice
         usleep(tslice*1000); //usleep takes microseconds
 
         sem_wait(&processtable->sem);
-        
         //stop currently running processes
         for (int i = 0; i < processtable->count; i++) {
+		//check if finished process
             if (processtable->table[i].state == 1) {
                 kill(processtable->table[i].pid, SIGSTOP);
                 processtable->table[i].state = 0;
+		processtable->table[i].tslices_on_cpu++;
             }
         }
 
@@ -142,12 +139,14 @@ int main(int argc, char** argv) {
                 finished_count++;
             }
         }
-        if (finished_count == processtable->count && processtable->count > 0) {
+        if (finished_count == processtable->count && processtable->count > 0 && stop_scheduler) {
             break; //exit loop if all submitted processes are done
         }
 
         sem_post(&processtable->sem);
     }
+
+
 
     //final cleanup
     cleanup();
